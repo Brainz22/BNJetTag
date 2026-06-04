@@ -82,9 +82,12 @@ L1_REG     = 1e-4 # matches your original regularisation
 # 1-BIT PRIMITIVES
 # ══════════════════════════════════════════════════════════════════════════════
 
-class AbsMeanQuantizer(tf.keras.constraints.Constraint):
+class AbsMeanQuantizer(tf.keras.constraints.Constraint): #inherit from Constraint to apply after each optimizer step
     """
     Straight-through absmean quantizer used as a Keras weight *constraint*.
+
+    tf.keras.constraints.Constraint:
+    --> This class is a weight constraint — please call it automatically after every optimiser step to modify the weights.
 
     Applied after every optimiser step:
       W_ternary = clip( round( W / (mean|W| + eps) ), -1, 1 )
@@ -101,7 +104,7 @@ class AbsMeanQuantizer(tf.keras.constraints.Constraint):
         scale = tf.reduce_mean(tf.abs(w)) + self.eps
         w_scaled = w / scale
         # Straight-through: round in forward, identity in backward
-        w_ternary = w_scaled + tf.stop_gradient(
+        w_ternary = w_scaled + tf.stop_gradient(#stop gradient to make it identity in backward pass
             tf.clip_by_value(tf.round(w_scaled), -1.0, 1.0) - w_scaled
         )
         return w_ternary
@@ -173,7 +176,7 @@ class BitLinear(Layer):
 class RMSNorm(Layer):
     """
     Root-Mean-Square Layer Normalisation (no mean subtraction).
-    Preferred over LayerNorm in BitNet because the lack of centring
+    Preferred over LayerNorm in BitNet because the lack of centering
     preserves the sign structure of ternary activations.
 
       y = x / sqrt( mean(x²) + eps ) × γ
@@ -487,7 +490,7 @@ def main(args):
     kinematics(X, sampleData, y, "v1", tag)
 
     # ── pT-reweighting  (unchanged) ───────────────────────────────────────────
-    thebins    = np.linspace(0, 500, 20)
+    thebins    = np.linspace(0,  max(sampleData[:, 0]), 60)
     bkgPts     = sampleData[y == 0][:, 0]
     sigPts     = sampleData[y == 1][:, 0]
     bkg_counts, _ = np.histogram(bkgPts, bins=thebins)
@@ -538,9 +541,10 @@ def main(args):
 
     # ── Compile  (unchanged) ──────────────────────────────────────────────────
     model.compile(
-        loss      = "binary_crossentropy",
+        loss      =tf.keras.losses.BinaryCrossentropy(from_logits=True),
         optimizer = "adam",
         metrics   = ["binary_accuracy"],
+        weighted_metrics=[tf.keras.metrics.AUC(name="auc")]
     )
 
     # ── Callbacks  ────────────────────────────────────────────────────────────
@@ -596,10 +600,15 @@ def sanity_check():
     model.summary()
 
     # Shape check
-    dummy = np.random.randn(8, N_PART_PER_JET, N_FEAT).astype(np.float32)
-    out   = model(dummy, training=False)
+    dummy_x = np.random.randn(8, N_PART_PER_JET, N_FEAT).astype(np.float32)
+    dummy_y = np.random.randint(0, 2, (8, 1)).astype(np.float32)
+    out   = model(dummy_x, training=False)
     assert out.shape == (8, 1), f"Wrong output shape: {out.shape}"
-    print(f"\n✓  Input  shape : {dummy.shape}")
+
+    model.compile(loss="binary_crossentropy", optimizer="adam")
+    model.train_on_batch(dummy_x, dummy_y)
+
+    print(f"\n✓  Input  shape : {dummy_x.shape}")
     print(f"✓  Output shape : {out.shape}  (raw logit, no sigmoid)")
 
     # Check that BitLinear weights are ternary after one build
