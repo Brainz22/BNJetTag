@@ -19,10 +19,10 @@ Architecture overview
     │
   × N_LAYERS of BitTransformerBlock:
       ├─ RMSNorm
-      ├─ 1-bit Multi-Head Self-Attention  (Q/K/V projections are ternary)
+      ├─ 1-bit Multi-Head Self-Attention  (Q/K/V projections are binary)
       ├─ residual add
       ├─ RMSNorm
-      ├─ 1-bit FFN  (expand → contract, ternary weights)
+      ├─ 1-bit FFN  (expand → contract, binary weights)
       └─ residual add
     │
   Global average pool   →  (D_MODEL,)
@@ -31,7 +31,7 @@ Architecture overview
 
 BitLinear implementation
 ------------------------
-Weights are constrained to ternary {-1, 0, +1} during the forward pass
+Weights are constrained to binary {-1, 0, +1} during the forward pass
 via absmean quantization (straight-through estimator for gradients),
 exactly as described in "The Era of 1-bit LLMs: All Large Language Models
 are in 1.58 Bits" (Ma et al., 2024).
@@ -90,32 +90,38 @@ class AbsMeanQuantizer(tf.keras.constraints.Constraint): #inherit from Constrain
     --> This class is a weight constraint — please call it automatically after every optimiser step to modify the weights.
 
     Applied after every optimiser step:
-      W_ternary = clip( round( W / (mean|W| + eps) ), -1, 1 )
+      W_binary = clip( round( W / (mean|W| + eps) ), -1, 1 )
 
     The full-precision master weights are updated by the optimiser;
-    the constraint snaps them back to ternary for the forward pass.
-    Note: using a constraint means the stored weights ARE ternary, so
+    the constraint snaps them back to binary for the forward pass.
+    Note: using a constraint means the stored weights ARE binary, so
     inference is exact — no separate quantisation step needed.
     """
     def __init__(self, eps: float = 1e-6):
         self.eps = eps
 
     def __call__(self, w):
+        beta = scale = tf.reduce_mean(tf.abs(w))
         scale = tf.reduce_mean(tf.abs(w)) + self.eps
         w_scaled = w / scale
         # Straight-through: round in forward, identity in backward
-        w_ternary = w_scaled + tf.stop_gradient(#stop gradient to make it identity in backward pass
-            tf.clip_by_value(tf.round(w_scaled), -1.0, 1.0) - w_scaled
+        w_binary = w_scaled + tf.stop_gradient(#stop gradient to make it identity in backward pass
+            tf.sign(w_scaled) - w_scaled
         )
-        return w_ternary
+        return w_binary*beta # multiplies beta factor: the abs mean of weight matrix
 
     def get_config(self):
         return {"eps": self.eps}
 
+## Quant(x) Function 
+def activation_quant(x):
+    scale = 127.0 / tf.maximum(tf.reduce_max(tf.abs(x), axis=-1, keepdims=True), 1e-5)
+    return tf.clip_by_value(tf.round(x * scale), -128, 127) / scale
+
 
 class BitLinear(Layer):
     """
-    A fully-connected layer with ternary {-1, 0, +1} weights.
+    A fully-connected layer with binary {-1, +1} weights.
 
     Replaces tf.keras.layers.Dense for all projections inside the
     transformer.  Bias uses full float32 (bias contributes negligible
@@ -127,6 +133,8 @@ class BitLinear(Layer):
         use_bias   : whether to add a bias term (default True)
         reg        : L1 regularisation strength on the kernel
         name       : layer name
+
+    Calls activation_quant to quantize RMSNorm activation.
     """
     def __init__(self, units, use_bias=True, reg=L1_REG, **kwargs):
         super().__init__(**kwargs)
@@ -141,7 +149,7 @@ class BitLinear(Layer):
             shape       = (in_dim, self.units),
             initializer = "glorot_uniform",
             regularizer = l1(self.reg),
-            constraint  = AbsMeanQuantizer(),   # ← forces ternary weights
+            constraint  = AbsMeanQuantizer(),   # ← forces binary weights
             trainable   = True,
         )
         if self.use_bias:
@@ -155,9 +163,11 @@ class BitLinear(Layer):
         self.built = True
 
     def call(self, x):
-        # kernel is already ternary (enforced by the constraint after each step)
-        # matmul with ternary weights is equivalent to adds/subtracts only
-        out = tf.matmul(x, self.kernel)
+        # kernel is already binary (enforced by the constraint after each step)
+        # matmul with binary weights is equivalent to adds/subtracts only
+        # This implementation follows the paper closely.
+        x_norm = RMSNorm(name=self.name + "_norm")(x)
+        out = tf.matmul(activation_quant(x_norm), self.kernel)
         if self.use_bias:
             out = out + self.bias
         return out
@@ -177,25 +187,18 @@ class RMSNorm(Layer):
     """
     Root-Mean-Square Layer Normalisation (no mean subtraction).
     Preferred over LayerNorm in BitNet because the lack of centering
-    preserves the sign structure of ternary activations.
+    preserves the sign structure of binary activations.
 
-      y = x / sqrt( mean(x²) + eps ) × γ
+      y = (x - E(x)) / sqrt( mean(x²) + eps ) 
     """
     def __init__(self, eps: float = 1e-6, **kwargs):
         super().__init__(**kwargs)
         self.eps = eps
 
-    def build(self, input_shape):
-        dim = int(input_shape[-1])
-        self.gamma = self.add_weight(
-            name="gamma", shape=(dim,), initializer="ones", trainable=True
-        )
-        self.built = True
-
     def call(self, x):
-        rms = tf.sqrt(tf.reduce_mean(tf.square(x), axis=-1, keepdims=True)
-                      + self.eps)
-        return (x / rms) * self.gamma
+        mean = tf.reduce_mean(x, axis=-1, keepdims=True)
+        var = tf.math.reduce_variance(x, axis=-1, keepdims=True)
+        return (x - mean) / tf.sqrt(var + self.eps)
 
     def get_config(self):
         cfg = super().get_config()
@@ -212,7 +215,7 @@ class BitMHSA(Layer):
     1-bit Multi-Head Self-Attention.
 
     Q, K, V projections and the output projection all use BitLinear
-    (ternary weights).  The softmax attention scores themselves remain
+    (binary weights).  The softmax attention scores themselves remain
     in float32 — quantising attention logits severely harms performance
     at small scale.
 
@@ -245,7 +248,7 @@ class BitMHSA(Layer):
         B  = tf.shape(x)[0]
         N  = tf.shape(x)[1]   # sequence length = N_PART_PER_JET = 10
 
-        # Project with ternary weights  →  (B, N, d_model)
+        # Project with binary weights  →  (B, N, d_model)
         Q = self.W_q(x)
         K = self.W_k(x)
         V = self.W_v(x)
@@ -268,7 +271,7 @@ class BitMHSA(Layer):
         ctx = tf.transpose(ctx, perm=[0, 2, 1, 3])
         ctx = tf.reshape(ctx, (B, N, self.d_model))
 
-        # Output projection (ternary)
+        # Output projection (binary)
         return self.W_o(ctx)
 
     def get_config(self):
@@ -311,9 +314,8 @@ class BitFFN(Layer):
 class BitTransformerBlock(Layer):
     """
     One transformer block with pre-norm and residual connections:
-
-      x → RMSNorm → BitMHSA → + residual
-        → RMSNorm → BitFFN  → + residual
+      x → BitMHSA → + residual
+     → BitFFN  → + residual
     """
     def __init__(self, d_model, n_heads, ffn_dim, reg=L1_REG, **kwargs):
         super().__init__(**kwargs)
@@ -323,8 +325,6 @@ class BitTransformerBlock(Layer):
         self.reg      = reg
 
     def build(self, input_shape):
-        self.norm1 = RMSNorm(name=self.name + "_norm1")
-        self.norm2 = RMSNorm(name=self.name + "_norm2")
         self.attn  = BitMHSA(self.d_model, self.n_heads,
                               reg=self.reg, name=self.name + "_attn")
         self.ffn   = BitFFN(self.d_model, self.ffn_dim,
@@ -333,9 +333,9 @@ class BitTransformerBlock(Layer):
 
     def call(self, x, training=False):
         # Self-attention sub-layer
-        x = x + self.attn(self.norm1(x), training=training)
+        x = x + self.attn(x, training=training)
         # Feed-forward sub-layer
-        x = x + self.ffn(self.norm2(x))
+        x = x + self.ffn(x)
         return x
 
     def get_config(self):
@@ -378,11 +378,10 @@ def build_bitnet_jet_tagger(
     # ── Input ────────────────────────────────────────────────────────────────
     inputs = Input(shape=(n_particles, n_features), name="input_1")
 
-    # ── Input projection: N_FEAT → D_MODEL  (ternary BitLinear) ──────────────
-    # Mirrors your QConv1D(kernel_size=1) which is mathematically identical
+    # ── Input projection: N_FEAT → D_MODEL  (binary BitLinear) ──────────────
+    # Mirrors QConv1D(kernel_size=1) which is mathematically identical
     # to a per-particle Dense / BitLinear applied independently.
     x = BitLinear(d_model, reg=reg, name="input_proj")(inputs)
-    x = RMSNorm(name="input_norm")(x)
     # shape: (batch, 10, d_model)
 
     # ── Learned positional encoding  ─────────────────────────────────────────
@@ -407,16 +406,14 @@ def build_bitnet_jet_tagger(
         )(x)
     # shape: (batch, 10, d_model)
 
-    # ── Final normalisation before pooling  ──────────────────────────────────
-    x = RMSNorm(name="final_norm")(x)
 
     # ── Global average pool: sequence → vector  ───────────────────────────────
-    # Mirrors your GlobalAveragePooling1D — aggregates over particles.
+    # Mirrors GlobalAveragePooling1D — aggregates over particles.
     x = GlobalAveragePooling1D(name="global_average_pooling1d")(x)
     # shape: (batch, d_model)
 
     # ── Classification head  ──────────────────────────────────────────────────
-    # Two BitLinear layers to mirror your two QDense layers.
+    # Two BitLinear layers to mirror two QDense layers.
     x = BitLinear(d_model, reg=reg, name="head_fc1")(x)
     x = tf.keras.layers.Activation("relu", name="head_act")(x)
 
@@ -427,7 +424,7 @@ def build_bitnet_jet_tagger(
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# TRAINING SCRIPT  (mirrors your original train.py exactly)
+# TRAINING SCRIPT  (mirrors original train.py exactly)
 # ══════════════════════════════════════════════════════════════════════════════
 
 def main(args):
@@ -528,7 +525,7 @@ def main(args):
     # ── Pruning  (same schedule as your original) ─────────────────────────────
     # Note: tfmot pruning wraps Dense-like layers. BitLinear is a custom Layer,
     # so we selectively prune only the head Dense equivalents if needed.
-    # For the transformer blocks, the ternary constraint already achieves ~67%
+    # For the transformer blocks, the binary constraint already achieves ~67%
     # sparsity on average (roughly 1/3 of weights are zero after quantisation).
     # If you want explicit magnitude pruning on top, uncomment the block below.
 
@@ -589,7 +586,7 @@ def main(args):
 
 def sanity_check():
     """
-    Verify input/output shapes and that ternary constraints are applied.
+    Verify input/output shapes and that binary constraints are applied.
     Run with:  python bitnet_jet_tagger.py --sanity
     """
     print("=" * 60)
@@ -598,6 +595,13 @@ def sanity_check():
 
     model = build_bitnet_jet_tagger()
     model.summary()
+
+    tf.keras.utils.plot_model(
+        model,
+        to_file    = os.getcwd() + f"/model.png",
+        show_shapes= True,
+        show_layer_names=True,
+    )
 
     # Shape check
     dummy_x = np.random.randn(8, N_PART_PER_JET, N_FEAT).astype(np.float32)
@@ -611,18 +615,23 @@ def sanity_check():
     print(f"\n✓  Input  shape : {dummy_x.shape}")
     print(f"✓  Output shape : {out.shape}  (raw logit, no sigmoid)")
 
-    # Check that BitLinear weights are ternary after one build
-    ternary_ok = True
+    # Check that BitLinear weights are binary after one build
+    binary_ok = True
     for layer in model.layers:
         for w in layer.weights:
             if "kernel" in w.name:
                 vals = np.unique(np.round(w.numpy(), 4))
-                bad  = [v for v in vals if v not in (-1.0, 0.0, 1.0)]
+                bad  = [v for v in vals if v not in (np.min(vals), 0.0, np.max(vals))]
                 if bad:
-                    print(f"  ✗ {w.name}: non-ternary values {bad[:5]}")
-                    ternary_ok = False
-    if ternary_ok:
-        print("✓  All BitLinear kernels are ternary {-1, 0, +1}")
+                    print(f" {w.name}: non-binary values {bad[:5]}, weights.shape {w.numpy().shape}")
+                    binary_ok = False
+
+                #vals = np.unique(np.round(w.numpy(), 4))
+                good = [v for v in vals]
+                if good:
+                    print(f" {w.name}: binary values {good[:5]}, , weights.shape {w.numpy().shape}")
+    if binary_ok:
+        print("  All BitLinear kernels are binary {-1, +1}")
 
     # Parameter count comparison
     n_params = model.count_params()
